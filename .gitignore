@@ -9,3 +9,7 @@ uploads/*
 reports/*
 *.log
 *.log.err
+database/*.db
+database/*.db-shm
+database/*.db-wal
+database/*.db-journal
