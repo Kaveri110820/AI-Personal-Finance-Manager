@@ -7,6 +7,7 @@ __pycache__/
 
 uploads/*
 reports/*
+data/
 *.log
 *.log.err
 database/*.db

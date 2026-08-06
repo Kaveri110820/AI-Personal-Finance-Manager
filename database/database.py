@@ -38,6 +38,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_monthly
     ON budgets(scope) WHERE category IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_category
     ON budgets(scope, category) WHERE category IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS bills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    due_date TEXT NOT NULL,
+    amount REAL NOT NULL CHECK (amount >= 0),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'paid')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_bills_due_date ON bills(due_date);
+CREATE INDEX IF NOT EXISTS idx_bills_status ON bills(status);
 """
 
 
