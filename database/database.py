@@ -51,6 +51,16 @@ CREATE TABLE IF NOT EXISTS bills (
 
 CREATE INDEX IF NOT EXISTS idx_bills_due_date ON bills(due_date);
 CREATE INDEX IF NOT EXISTS idx_bills_status ON bills(status);
+
+CREATE TABLE IF NOT EXISTS investments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    investment_type TEXT NOT NULL,
+    amount REAL NOT NULL CHECK (amount >= 0),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_investments_type ON investments(investment_type);
 """
 
 
