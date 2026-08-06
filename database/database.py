@@ -20,6 +20,24 @@ CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
 CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_fingerprint
     ON transactions(date, description, amount);
+
+CREATE TABLE IF NOT EXISTS budgets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL,
+    category TEXT,
+    amount REAL NOT NULL CHECK (amount >= 0),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK (scope IN ('monthly', 'category')),
+    CHECK (
+        (scope = 'monthly' AND category IS NULL)
+        OR (scope = 'category' AND category IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_monthly
+    ON budgets(scope) WHERE category IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_category
+    ON budgets(scope, category) WHERE category IS NOT NULL;
 """
 
 
