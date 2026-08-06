@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT NOT NULL,
     description TEXT NOT NULL,
-    category TEXT NOT NULL DEFAULT 'Uncategorized',
+    category TEXT NOT NULL DEFAULT 'Others',
     amount REAL NOT NULL,
     balance REAL,
     source TEXT,

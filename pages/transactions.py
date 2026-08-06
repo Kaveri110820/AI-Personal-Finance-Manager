@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from services.ai_service import AIService, CATEGORIES
 from services.transaction_service import TransactionService, categorize
 from utils.excel_reader import extract_transactions_from_excel
 from utils.pdf_reader import extract_transactions_from_pdf
@@ -22,26 +23,26 @@ COLORS = {
 COLUMN_ORDER = ["id", "date", "description", "category", "amount", "balance", "delete"]
 
 SAMPLE_TRANSACTIONS = [
-    ("Salary deposit", "Income", 4200.00),
-    ("Rent payment", "Housing", -1850.00),
-    ("Grocery store", "Groceries", -96.20),
-    ("Coffee shop", "Dining Out", -4.85),
-    ("Electricity bill", "Utilities", -74.80),
-    ("Online subscription", "Entertainment", -15.99),
-    ("Fuel station", "Transport", -52.40),
-    ("Gym membership", "Health", -35.00),
-    ("Freelance project", "Income", 850.00),
-    ("Phone bill", "Utilities", -42.50),
-    ("Restaurant dinner", "Dining Out", -62.30),
+    ("Monthly salary deposit", "Salary", 4200.00),
+    ("Rent payment", "Bills", -1850.00),
+    ("Tesco supermarket", "Food", -96.20),
+    ("Starbucks coffee", "Food", -4.85),
+    ("Electricity bill", "Bills", -74.80),
+    ("Netflix subscription", "Entertainment", -15.99),
+    ("Shell fuel station", "Travel", -52.40),
+    ("Gym membership", "Healthcare", -35.00),
+    ("Freelance project invoice", "Salary", 850.00),
+    ("Mobile phone bill", "Bills", -42.50),
+    ("Restaurant dinner", "Food", -62.30),
     ("Amazon order", "Shopping", -38.75),
-    ("Pharmacy", "Health", -18.20),
-    ("Train ticket", "Transport", -28.40),
+    ("Pharmacy prescription", "Healthcare", -18.20),
+    ("Train ticket", "Travel", -28.40),
     ("Movie night", "Entertainment", -24.00),
-    ("Water bill", "Utilities", -31.60),
-    ("Supermarket", "Groceries", -118.45),
-    ("Uber ride", "Transport", -19.80),
-    ("Interest earned", "Income", 12.34),
-    ("Clothing store", "Shopping", -64.90),
+    ("Water bill", "Bills", -31.60),
+    ("Whole Foods grocery", "Food", -118.45),
+    ("Uber ride", "Travel", -19.80),
+    ("Dividend payout", "Investment", 12.34),
+    ("Zara clothing", "Shopping", -64.90),
 ]
 
 PREVIEW_COLUMNS = {
@@ -82,6 +83,18 @@ def _clear_filters():
         st.session_state.pop(key, None)
 
 
+def _run_ai_categorize():
+    records = st.session_state.get("tx_ai_set") or []
+    if not records:
+        return
+    result = st.session_state.ai.apply_categories(st.session_state.service, records)
+    st.session_state.ai_done = result
+
+
+def _ai_reset():
+    st.session_state.pop("ai_done", None)
+
+
 def _on_delete_click():
     click = st.session_state.get("tx_delete")
     if not click:
@@ -99,9 +112,12 @@ st.session_state.setdefault("pending_import_source", None)
 st.session_state.setdefault("pending_delete", None)
 st.session_state.setdefault("pending_delete_desc", None)
 st.session_state.setdefault("import_done", None)
+st.session_state.setdefault("ai_done", None)
 st.session_state.setdefault("service", TransactionService())
+st.session_state.setdefault("ai", AIService())
 
 service = st.session_state.service
+ai = st.session_state.ai
 
 st.title(":material/receipt_long: Transactions")
 st.caption("Upload a bank statement, review the extracted rows, then search, filter and manage your transactions.")
@@ -222,6 +238,7 @@ with st.sidebar:
         icon=":material/search:",
     )
     all_categories = service.get_categories()
+    category_options = list(dict.fromkeys([*CATEGORIES, *all_categories]))
     selected_categories = st.multiselect(
         "Category",
         all_categories,
@@ -315,6 +332,77 @@ if filters_active:
 else:
     st.caption(f"Showing all {len(filtered_df):,} transactions.")
 
+ai_done = st.session_state.get("ai_done")
+if ai_done:
+    st.success(
+        f"AI categorizer processed **{ai_done['processed']:,}** transactions "
+        f"and updated **{ai_done['changed']:,}** categories.",
+        icon=":material/auto_awesome:",
+    )
+    st.session_state.pop("ai_done", None)
+
+st.space("small")
+
+with st.container(border=True):
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        st.markdown("### :material/auto_awesome: AI Expense Categorizer")
+        st.caption(
+            "Automatically assigns every transaction to one of 10 categories — "
+            f"{', '.join(CATEGORIES)}. Uses a placeholder rule-based model for now; "
+            "a real model can be plugged into the AIService later."
+        )
+    with c2:
+        n_uncategorized = int(
+            filtered_df["category"].isin(["Uncategorized", "Others"]).sum()
+        )
+        st.metric("Uncategorized", f"{n_uncategorized:,}", border=True)
+    suggestions = []
+    for _, row in filtered_df.iterrows():
+        suggestions.append(
+            {
+                "id": int(row["id"]),
+                "description": str(row["description"]),
+                "category": str(row["category"]),
+                "suggested": ai.categorize(str(row["description"]), row["amount"]),
+            }
+        )
+    st.session_state.tx_ai_set = suggestions
+    proposed = pd.DataFrame(suggestions)
+    n_suggested = int((proposed["suggested"] != proposed["category"]).sum())
+    if n_suggested == 0:
+        st.success(
+            "All transactions already match the AI's suggestion. Nothing to update.",
+            icon=":material/check_circle:",
+        )
+    else:
+        st.markdown(
+            f"The AI suggests a **different category for {n_suggested:,}** of the "
+            f"{len(filtered_df):,} transactions currently in view."
+        )
+        preview = proposed.loc[proposed["suggested"] != proposed["category"], ["description", "category", "suggested"]]
+        preview.columns = ["Description", "Current category", "AI suggestion"]
+        st.dataframe(preview.head(10), hide_index=True, key="ai_preview")
+        st.caption(f"Sample of the first {min(10, len(preview)):,} proposed changes. Applying updates the SQLite database.")
+        left_col, right_col = st.columns([1, 1])
+        with left_col:
+            st.button(
+                f"Apply {n_suggested:,} suggested categories",
+                type="primary",
+                icon=":material/auto_awesome:",
+                on_click=_run_ai_categorize,
+                key="ai_apply_btn",
+                width="stretch",
+            )
+        with right_col:
+            st.button(
+                "Reset banner",
+                icon=":material/restart_alt:",
+                help="Dismiss the result banner (does not change the database).",
+                on_click=_ai_reset,
+                key="ai_reset_btn",
+            )
+
 st.space("small")
 
 if filtered_df.empty:
@@ -354,7 +442,7 @@ st.data_editor(
         "description": st.column_config.TextColumn("Description"),
         "category": st.column_config.SelectboxColumn(
             "Category",
-            options=all_categories or ["Uncategorized"],
+            options=category_options or CATEGORIES,
             required=True,
             help="Change the category directly in this cell.",
         ),
