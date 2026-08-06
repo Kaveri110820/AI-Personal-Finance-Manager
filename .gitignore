@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.streamlit/secrets.toml
+
+uploads/*
+reports/*
+*.log
+*.log.err
