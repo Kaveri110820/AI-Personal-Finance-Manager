@@ -1,5 +1,7 @@
 import re
 
+import pandas as pd
+
 CATEGORIES = [
     "Food",
     "Travel",
@@ -257,6 +259,57 @@ _KEYWORD_RULES = [
 ]
 
 
+DISCRETIONARY_CATEGORIES = {"Food", "Shopping", "Entertainment", "Travel"}
+
+SAVINGS_FACTORS = {
+    "Food": 0.15,
+    "Shopping": 0.15,
+    "Entertainment": 0.15,
+    "Travel": 0.10,
+    "Bills": 0.05,
+    "Healthcare": 0.05,
+    "Education": 0.10,
+}
+
+SAVINGS_TIPS = {
+    "Food": (
+        "Cook at home more",
+        "Takeaway, delivery and restaurants cost far more than home cooking. "
+        "Trimming dining out by 15% is a realistic, painless saving.",
+    ),
+    "Shopping": (
+        "Delay impulse purchases",
+        "Shopping is the easiest category to cut. Waiting 72 hours before a "
+        "non-essential buy typically removes about 15% of the spend.",
+    ),
+    "Entertainment": (
+        "Trim subscriptions",
+        "Streaming and entertainment subscriptions accumulate quietly. Dropping the "
+        "services you rarely open can free up around 15% of this spend.",
+    ),
+    "Travel": (
+        "Plan trips ahead",
+        "Filling up and booking travel earlier cuts costs. Carpooling or using "
+        "public transport a few days a week saves around 10%.",
+    ),
+    "Bills": (
+        "Shop around for bills",
+        "Utility and insurance providers differ wildly in price. Comparing plans "
+        "and using less energy can shave about 5% off your bills.",
+    ),
+    "Healthcare": (
+        "Review recurring health costs",
+        "Generic medicines, pharmacy price checks and gym plan reviews can reduce "
+        "healthcare spending by around 5%.",
+    ),
+    "Education": (
+        "Use free learning resources",
+        "Free courses, libraries and employer benefits can replace paid training. "
+        "A 10% trim here is achievable.",
+    ),
+}
+
+
 class AIService:
     def __init__(self, provider: str = "placeholder", model: str | None = None):
         self.provider = provider
@@ -299,3 +352,68 @@ class AIService:
         if amount is not None and amount > 0:
             return "Salary"
         return "Others"
+
+    def analyze_savings(self, transactions: pd.DataFrame) -> dict | None:
+        if transactions is None or getattr(transactions, "empty", True):
+            return None
+        expenses = transactions.loc[transactions["amount"] < 0]
+        if expenses.empty:
+            return None
+        expense_total = float(-expenses["amount"].sum())
+        income_total = float(
+            transactions.loc[transactions["amount"] > 0, "amount"].sum()
+        )
+        savings = round(income_total - expense_total, 2)
+        savings_rate = round(savings / income_total * 100, 1) if income_total > 0 else 0.0
+
+        by_category = (
+            expenses.groupby("category")["amount"].sum().abs().sort_values(ascending=False)
+        )
+        category_spending = {str(key): float(value) for key, value in by_category.items()}
+        top_category = str(by_category.index[0])
+        top_amount = float(by_category.iloc[0])
+
+        suggestions = []
+        for category, spent in by_category.items():
+            key = str(category)
+            if key in SAVINGS_TIPS:
+                factor = SAVINGS_FACTORS.get(key, 0.1)
+                suggestions.append(
+                    {
+                        "category": key,
+                        "title": SAVINGS_TIPS[key][0],
+                        "message": SAVINGS_TIPS[key][1],
+                        "spent": round(float(spent), 2),
+                        "potential": round(float(spent) * factor, 2),
+                    }
+                )
+        suggestions.sort(key=lambda item: item["potential"], reverse=True)
+
+        unnecessary = []
+        for category, spent in by_category.items():
+            key = str(category)
+            if key in DISCRETIONARY_CATEGORIES:
+                factor = SAVINGS_FACTORS.get(key, 0.1)
+                unnecessary.append(
+                    {
+                        "category": key,
+                        "amount": round(float(spent), 2),
+                        "potential": round(float(spent) * factor, 2),
+                    }
+                )
+        unnecessary.sort(key=lambda item: item["amount"], reverse=True)
+
+        additional_savings = round(sum(item["potential"] for item in suggestions), 2)
+        return {
+            "income": income_total,
+            "expense": expense_total,
+            "savings": savings,
+            "savings_rate": savings_rate,
+            "top_category": top_category,
+            "top_amount": top_amount,
+            "category_spending": category_spending,
+            "suggestions": suggestions,
+            "unnecessary": unnecessary,
+            "additional_savings": additional_savings,
+            "estimated_savings": round(savings + additional_savings, 2),
+        }
