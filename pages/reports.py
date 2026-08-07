@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from services.ai_service import AIService
 from services.report_service import ReportService
 from utils.pdf_report import generate_report_pdf
 
@@ -60,8 +61,10 @@ def _make_category_chart(categories: pd.DataFrame) -> go.Figure:
 
 
 st.session_state.setdefault("report_service", ReportService())
+st.session_state.setdefault("report_ai", AIService())
 
 service = st.session_state.report_service
+ai = st.session_state.report_ai
 
 st.title(":material/bar_chart: Financial Reports")
 st.caption("A monthly snapshot of your income, expenses, savings, budgets, bills and investments.")
@@ -89,7 +92,28 @@ with st.sidebar:
 month = MONTH_NAMES.index(month_name) + 1
 month_label = f"{month_name} {year}"
 
+report_key = (year, month)
+if st.session_state.get("rpt_summary_key") != report_key:
+    st.session_state.rpt_summary_key = report_key
+    st.session_state.pop("rpt_summary", None)
+
 report = service.generate(year, month)
+
+report_sig = (
+    report["income"],
+    report["expense"],
+    report["bills_total"],
+    len(report["categories"]),
+    len(report["budget_overview"]),
+)
+if (
+    st.session_state.get("rpt_summary") is None
+    or st.session_state.get("rpt_summary_sig") != report_sig
+):
+    with st.spinner("Writing your AI report summary…"):
+        st.session_state.rpt_summary = ai.generate_report_summary(report)
+    st.session_state.rpt_summary_sig = report_sig
+report_summary = st.session_state.rpt_summary
 
 with st.container(horizontal=True):
     st.metric("Income", f"${report['income']:,.2f}", border=True)
@@ -113,6 +137,27 @@ with st.container(horizontal=True):
     )
 
 st.space("small")
+
+if report_summary:
+    with st.container(border=True):
+        st.markdown("### :material/summarize: Executive summary")
+        st.markdown(report_summary["summary"])
+        hl_col, cn_col = st.columns(2, gap="large")
+        with hl_col:
+            if report_summary["highlights"]:
+                st.markdown("**Highlights**")
+                for item in report_summary["highlights"]:
+                    st.markdown(f"- {item}")
+        with cn_col:
+            if report_summary["concerns"]:
+                st.markdown("**Concerns**")
+                for item in report_summary["concerns"]:
+                    st.markdown(f"- {item}")
+        st.caption(
+            "Written by Gemini." if report_summary["source"] == "gemini"
+            else "From built-in rules (no API key configured)."
+        )
+    st.space("small")
 
 if report["income"] == 0 and report["expense"] == 0:
     st.info(

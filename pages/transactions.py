@@ -339,6 +339,10 @@ if ai_done:
         f"and updated **{ai_done['changed']:,}** categories.",
         icon=":material/auto_awesome:",
     )
+    if ai_done.get("source") == "gemini":
+        st.caption("Categorized with Gemini AI.")
+    else:
+        st.caption("Categorized with built-in rules (no API key configured).")
     st.session_state.pop("ai_done", None)
 
 st.space("small")
@@ -349,8 +353,8 @@ with st.container(border=True):
         st.markdown("### :material/auto_awesome: AI Expense Categorizer")
         st.caption(
             "Automatically assigns every transaction to one of 10 categories — "
-            f"{', '.join(CATEGORIES)}. Uses a placeholder rule-based model for now; "
-            "a real model can be plugged into the AIService later."
+            f"{', '.join(CATEGORIES)}. Powered by Gemini; falls back to built-in "
+            "rules when no API key is configured."
         )
     with c2:
         n_uncategorized = int(
@@ -358,13 +362,23 @@ with st.container(border=True):
         )
         st.metric("Uncategorized", f"{n_uncategorized:,}", border=True)
     suggestions = []
-    for _, row in filtered_df.iterrows():
+    batch_input = [
+        {
+            "id": int(row["id"]),
+            "description": str(row["description"]),
+            "amount": float(row["amount"]),
+            "current_category": str(row["category"]),
+        }
+        for _, row in filtered_df.iterrows()
+    ]
+    batch_output = ai.categorize_batch(batch_input)
+    for rec in batch_output:
         suggestions.append(
             {
-                "id": int(row["id"]),
-                "description": str(row["description"]),
-                "category": str(row["category"]),
-                "suggested": ai.categorize(str(row["description"]), row["amount"]),
+                "id": int(rec["id"]),
+                "description": str(rec["description"]),
+                "category": str(rec.get("current_category") or "Others"),
+                "suggested": str(rec.get("category") or "Others"),
             }
         )
     st.session_state.tx_ai_set = suggestions
