@@ -113,6 +113,8 @@ if (
     with st.spinner("Writing your AI report summary…"):
         st.session_state.rpt_summary = ai.generate_report_summary(report)
     st.session_state.rpt_summary_sig = report_sig
+    if st.session_state.rpt_summary:
+        service.update_summary(year, month, st.session_state.rpt_summary)
 report_summary = st.session_state.rpt_summary
 
 with st.container(horizontal=True):

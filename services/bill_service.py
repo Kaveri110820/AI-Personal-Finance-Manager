@@ -1,11 +1,13 @@
 import calendar
 import datetime as dt
-from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
+from sqlalchemy import func, select
 
-from database.database import DB_PATH, get_connection, init_db
+from database.crud import BillRepository, log_history
+from database.database import DB_PATH, init_db, session_scope
+from database.models import Bill
 
 VALID_STATUSES = ("pending", "paid")
 
@@ -15,13 +17,12 @@ class BillService:
         self.db_path = Path(db_path) if db_path else DB_PATH
         init_db(self.db_path)
 
-    @contextmanager
-    def _connection(self):
-        conn = get_connection(self.db_path)
-        try:
-            yield conn
-        finally:
-            conn.close()
+    @staticmethod
+    def _frame(rows: list[Bill]) -> pd.DataFrame:
+        return pd.DataFrame(
+            [row.to_dict() for row in rows],
+            columns=["id", "name", "due_date", "amount", "status"],
+        )
 
     def add_bill(
         self, name: str, due_date: str, amount: float, status: str = "pending"
@@ -29,13 +30,21 @@ class BillService:
         name = str(name).strip()
         if status not in VALID_STATUSES:
             status = "pending"
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "INSERT INTO bills (name, due_date, amount, status) VALUES (?, ?, ?, ?)",
-                (name, str(due_date), float(amount), status),
+        with session_scope(self.db_path) as session:
+            obj = BillRepository(session).create(
+                name=name,
+                due_date=str(due_date),
+                amount=float(amount),
+                status=status,
             )
-            conn.commit()
-            return int(cursor.lastrowid)
+            log_history(
+                session,
+                "bill_added",
+                "bill",
+                entity_id=obj.id,
+                details={"name": name, "due_date": str(due_date), "amount": float(amount), "status": status},
+            )
+            return int(obj.id)
 
     def update_bill(
         self,
@@ -47,122 +56,130 @@ class BillService:
     ) -> bool:
         if status not in VALID_STATUSES:
             status = "pending"
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "UPDATE bills SET name = ?, due_date = ?, amount = ?, status = ? "
-                "WHERE id = ?",
-                (
-                    str(name).strip(),
-                    str(due_date),
-                    float(amount),
-                    status,
-                    int(bill_id),
-                ),
+        with session_scope(self.db_path) as session:
+            repo = BillRepository(session)
+            updated = repo.update_by_id(
+                int(bill_id),
+                name=str(name).strip(),
+                due_date=str(due_date),
+                amount=float(amount),
+                status=status,
             )
-            conn.commit()
-            return cursor.rowcount > 0
+            if updated:
+                log_history(
+                    session,
+                    "bill_updated",
+                    "bill",
+                    entity_id=int(bill_id),
+                    details={"name": str(name).strip(), "due_date": str(due_date), "amount": float(amount), "status": status},
+                )
+            return updated
 
     def set_status(self, bill_id: int, status: str) -> bool:
         if status not in VALID_STATUSES:
             return False
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "UPDATE bills SET status = ? WHERE id = ?",
-                (status, int(bill_id)),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
+        with session_scope(self.db_path) as session:
+            repo = BillRepository(session)
+            updated = repo.update_by_id(int(bill_id), status=status)
+            if updated:
+                log_history(
+                    session,
+                    "bill_status_changed",
+                    "bill",
+                    entity_id=int(bill_id),
+                    details={"status": status},
+                )
+            return updated
 
     def delete_bill(self, bill_id: int) -> bool:
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "DELETE FROM bills WHERE id = ?",
-                (int(bill_id),),
+        with session_scope(self.db_path) as session:
+            repo = BillRepository(session)
+            obj = repo.get(int(bill_id))
+            if obj is None:
+                return False
+            log_history(
+                session,
+                "bill_deleted",
+                "bill",
+                entity_id=int(bill_id),
+                details={"name": obj.name},
             )
-            conn.commit()
-            return cursor.rowcount > 0
+            repo.delete(obj)
+            return True
 
     def get_bill(self, bill_id: int) -> dict | None:
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT id, name, due_date, amount, status FROM bills WHERE id = ?",
-                (int(bill_id),),
-            ).fetchone()
-        return dict(row) if row else None
+        with session_scope(self.db_path) as session:
+            obj = BillRepository(session).get(int(bill_id))
+            return obj.to_dict() if obj else None
+
+    def _query(self, *conditions) -> pd.DataFrame:
+        statement = (
+            select(Bill)
+            .where(*conditions)
+            .order_by(Bill.due_date, Bill.name)
+        )
+        with session_scope(self.db_path) as session:
+            rows = list(session.execute(statement).scalars().all())
+        return self._frame(rows)
 
     def get_bills(self) -> pd.DataFrame:
-        with self._connection() as conn:
-            frame = pd.read_sql_query(
-                "SELECT id, name, due_date, amount, status FROM bills "
-                "ORDER BY due_date, name",
-                conn,
-            )
-        return frame
-
-    def _bills_where(self, where: str, params: tuple = ()) -> pd.DataFrame:
-        with self._connection() as conn:
-            frame = pd.read_sql_query(
-                f"SELECT id, name, due_date, amount, status FROM bills "
-                f"WHERE {where} ORDER BY due_date, name",
-                conn,
-                params=params,
-            )
-        return frame
+        return self._query()
 
     def get_due_today(self) -> pd.DataFrame:
         today = dt.date.today().isoformat()
-        return self._bills_where(
-            "status = 'pending' AND due_date = ?", (today,)
-        )
+        return self._query(Bill.status == "pending", Bill.due_date == today)
 
     def get_overdue(self) -> pd.DataFrame:
         today = dt.date.today().isoformat()
-        return self._bills_where(
-            "status = 'pending' AND due_date < ?", (today,)
-        )
+        return self._query(Bill.status == "pending", Bill.due_date < today)
 
     def get_upcoming(self, days: int = 30) -> pd.DataFrame:
         today = dt.date.today().isoformat()
         horizon = (dt.date.today() + dt.timedelta(days=int(days))).isoformat()
-        return self._bills_where(
-            "status = 'pending' AND due_date >= ? AND due_date <= ?",
-            (today, horizon),
+        return self._query(
+            Bill.status == "pending",
+            Bill.due_date >= today,
+            Bill.due_date <= horizon,
         )
 
     def get_reminders(self, days: int = 30) -> pd.DataFrame:
         horizon = (dt.date.today() + dt.timedelta(days=int(days))).isoformat()
-        return self._bills_where(
-            "status = 'pending' AND due_date <= ?",
-            (horizon,),
-        )
+        return self._query(Bill.status == "pending", Bill.due_date <= horizon)
 
     def get_monthly_total(self, year: int, month: int) -> float:
         start = dt.date(year, month, 1).isoformat()
         last = dt.date(year, month, calendar.monthrange(year, month)[1])
         end = last.isoformat()
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(SUM(amount), 0) AS total FROM bills "
-                "WHERE status = 'pending' AND due_date >= ? AND due_date <= ?",
-                (start, end),
-            ).fetchone()
-        return float(row["total"])
+        with session_scope(self.db_path) as session:
+            total = session.execute(
+                select(func.coalesce(func.sum(Bill.amount), 0)).where(
+                    Bill.status == "pending",
+                    Bill.due_date >= start,
+                    Bill.due_date <= end,
+                )
+            ).scalar_one()
+        return float(total)
 
     def get_stats(self) -> dict:
-        with self._connection() as conn:
-            total = conn.execute(
-                "SELECT COUNT(*) AS n FROM bills"
-            ).fetchone()["n"]
-            paid = conn.execute(
-                "SELECT COUNT(*) AS n FROM bills WHERE status = 'paid'"
-            ).fetchone()["n"]
-            pending_total = conn.execute(
-                "SELECT COALESCE(SUM(amount), 0) AS total FROM bills "
-                "WHERE status = 'pending'"
-            ).fetchone()["total"]
+        with session_scope(self.db_path) as session:
+            total = int(
+                session.execute(select(func.count()).select_from(Bill)).scalar_one()
+            )
+            paid = int(
+                session.execute(
+                    select(func.count()).select_from(Bill).where(Bill.status == "paid")
+                ).scalar_one()
+            )
+            pending_total = float(
+                session.execute(
+                    select(func.coalesce(func.sum(Bill.amount), 0)).where(
+                        Bill.status == "pending"
+                    )
+                ).scalar_one()
+            )
         return {
-            "total": int(total),
-            "paid": int(paid),
-            "pending": int(total) - int(paid),
-            "pending_total": float(pending_total),
+            "total": total,
+            "paid": paid,
+            "pending": total - paid,
+            "pending_total": pending_total,
         }

@@ -1,14 +1,19 @@
 import datetime as dt
-from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
+from sqlalchemy import func, or_, select
 
-from database.database import DB_PATH, get_connection, init_db
+from database.crud import TransactionRepository, log_history
+from database.database import DB_PATH, init_db, session_scope
+from database.models import Transaction
 from services.ai_service import AIService
 from utils.excel_reader import parse_date
 
 DEFAULT_CATEGORY = "Others"
+
+_PUBLIC_COLUMNS = ("id", "date", "description", "category", "amount", "balance", "source")
+_QUERY_COLUMNS = ("id", "date", "description", "category", "amount", "balance", "source", "created_at")
 
 
 def categorize(description: str, amount: float | None) -> str:
@@ -19,14 +24,6 @@ class TransactionService:
     def __init__(self, db_path: str | Path | None = None):
         self.db_path = Path(db_path) if db_path else DB_PATH
         init_db(self.db_path)
-
-    @contextmanager
-    def _connection(self):
-        conn = get_connection(self.db_path)
-        try:
-            yield conn
-        finally:
-            conn.close()
 
     @staticmethod
     def _normalise_date(value) -> str | None:
@@ -71,46 +68,99 @@ class TransactionService:
             return None
         amount = float(amount)
         category = category or categorize(description, amount)
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "INSERT OR IGNORE INTO transactions (date, description, category, amount, balance, source) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (date_iso, description, category, amount, balance, source),
+        with session_scope(self.db_path) as session:
+            repo = TransactionRepository(session)
+            fingerprint = repo.fingerprint_of(date_iso, description, amount)
+            if fingerprint in repo.existing_fingerprints(
+                [{"date": date_iso, "description": description, "amount": amount}]
+            ):
+                return None
+            obj = repo.create(
+                date=date_iso,
+                description=description,
+                category=category,
+                amount=amount,
+                balance=balance,
+                source=source,
             )
-            conn.commit()
-            return cursor.lastrowid if cursor.rowcount else None
+            log_history(
+                session,
+                "transaction_added",
+                "transaction",
+                entity_id=obj.id,
+                details={
+                    "date": date_iso,
+                    "description": description,
+                    "category": category,
+                    "amount": amount,
+                },
+            )
+            return int(obj.id)
 
     def add_transactions(self, records: list[dict]) -> tuple[int, int]:
-        inserted = 0
+        valid: list[dict] = []
         skipped = 0
-        with self._connection() as conn:
-            for record in records:
-                date_iso = self._normalise_date(record.get("date"))
-                description = str(record.get("description", "")).strip()
-                amount = record.get("amount")
-                if not date_iso or not description or amount is None:
-                    skipped += 1
-                    continue
-                try:
-                    amount = float(amount)
-                except (TypeError, ValueError):
-                    skipped += 1
-                    continue
-                category = record.get("category") or categorize(description, amount)
-                balance = record.get("balance")
-                balance = float(balance) if balance is not None else None
-                source = record.get("source")
-                cursor = conn.execute(
-                    "INSERT OR IGNORE INTO transactions (date, description, category, amount, balance, source) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (date_iso, description, category, amount, balance, source),
+        for record in records:
+            date_iso = self._normalise_date(record.get("date"))
+            description = str(record.get("description", "")).strip()
+            amount = record.get("amount")
+            if not date_iso or not description or amount is None:
+                skipped += 1
+                continue
+            try:
+                amount = float(amount)
+            except (TypeError, ValueError):
+                skipped += 1
+                continue
+            category = record.get("category") or categorize(description, amount)
+            balance = record.get("balance")
+            balance = float(balance) if balance is not None else None
+            source = record.get("source")
+            valid.append(
+                {
+                    "date": date_iso,
+                    "description": description,
+                    "category": category,
+                    "amount": amount,
+                    "balance": balance,
+                    "source": source,
+                }
+            )
+
+        with session_scope(self.db_path) as session:
+            repo = TransactionRepository(session)
+            existing = repo.existing_fingerprints(valid)
+            to_insert = [
+                record
+                for record in valid
+                if repo.fingerprint_of(
+                    record["date"], record["description"], record["amount"]
                 )
-                if cursor.rowcount:
-                    inserted += 1
-                else:
-                    skipped += 1
-            conn.commit()
-        return inserted, skipped
+                not in existing
+            ]
+            skipped += len(valid) - len(to_insert)
+            if to_insert:
+                session.add_all(
+                    [
+                        Transaction(
+                            date=r["date"],
+                            description=r["description"],
+                            category=r["category"],
+                            amount=r["amount"],
+                            balance=r["balance"],
+                            source=r["source"],
+                        )
+                        for r in to_insert
+                    ]
+                )
+                session.flush()
+                log_history(
+                    session,
+                    "transactions_imported",
+                    "transaction",
+                    details={"inserted": len(to_insert), "skipped": skipped},
+                )
+        return len(to_insert), skipped
 
     def import_dataframe(self, frame: pd.DataFrame) -> tuple[int, int, int]:
         if frame is None or frame.empty:
@@ -157,86 +207,113 @@ class TransactionService:
         end=None,
         categories: list[str] | None = None,
     ) -> pd.DataFrame:
-        clauses = []
-        params: list = []
+        conditions = []
         if search:
-            clauses.append("(description LIKE ? OR category LIKE ?)")
             pattern = f"%{search}%"
-            params.extend([pattern, pattern])
+            conditions.append(
+                or_(
+                    Transaction.description.like(pattern),
+                    Transaction.category.like(pattern),
+                )
+            )
         start_iso = self._as_iso(start)
         end_iso = self._as_iso(end)
         if start_iso:
-            clauses.append("date >= ?")
-            params.append(start_iso)
+            conditions.append(Transaction.date >= start_iso)
         if end_iso:
-            clauses.append("date <= ?")
-            params.append(end_iso)
+            conditions.append(Transaction.date <= end_iso)
         if categories:
-            placeholders = ", ".join("?" for _ in categories)
-            clauses.append(f"category IN ({placeholders})")
-            params.extend(categories)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        sql = (
-            "SELECT id, date, description, category, amount, balance, source, created_at "
-            f"FROM transactions {where} ORDER BY date DESC, id DESC"
+            conditions.append(Transaction.category.in_(categories))
+
+        statement = (
+            select(Transaction)
+            .where(*conditions)
+            .order_by(Transaction.date.desc(), Transaction.id.desc())
         )
-        with self._connection() as conn:
-            frame = pd.read_sql_query(sql, conn, params=params)
+        with session_scope(self.db_path) as session:
+            rows = list(session.execute(statement).scalars().all())
+        frame = pd.DataFrame([row.to_dict() for row in rows], columns=_QUERY_COLUMNS)
         if frame.empty:
             return frame
         frame["date"] = pd.to_datetime(frame["date"]).dt.date
         return frame
 
     def get_by_id(self, transaction_id: int) -> dict | None:
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT id, date, description, category, amount, balance, source FROM transactions WHERE id = ?",
-                (int(transaction_id),),
-            ).fetchone()
-        if row is None:
-            return None
-        return dict(row)
+        with session_scope(self.db_path) as session:
+            obj = TransactionRepository(session).get(int(transaction_id))
+            if obj is None:
+                return None
+            return {column: getattr(obj, column) for column in _PUBLIC_COLUMNS}
 
     def get_categories(self) -> list[str]:
-        with self._connection() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT category FROM transactions ORDER BY category"
-            ).fetchall()
-        return [row["category"] for row in rows]
+        with session_scope(self.db_path) as session:
+            rows = session.execute(
+                select(Transaction.category)
+                .distinct()
+                .order_by(Transaction.category)
+            ).scalars().all()
+        return [str(category) for category in rows]
 
     def update_category(self, transaction_id: int, category: str) -> bool:
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "UPDATE transactions SET category = ? WHERE id = ?",
-                (str(category).strip(), int(transaction_id)),
+        with session_scope(self.db_path) as session:
+            repo = TransactionRepository(session)
+            updated = repo.update_by_id(
+                int(transaction_id), category=str(category).strip()
             )
-            conn.commit()
-            return cursor.rowcount > 0
+            if updated:
+                log_history(
+                    session,
+                    "category_changed",
+                    "transaction",
+                    entity_id=int(transaction_id),
+                    details={"category": str(category).strip()},
+                )
+            return updated
 
     def delete(self, transaction_id: int) -> bool:
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "DELETE FROM transactions WHERE id = ?",
-                (int(transaction_id),),
+        with session_scope(self.db_path) as session:
+            repo = TransactionRepository(session)
+            obj = repo.get(int(transaction_id))
+            if obj is None:
+                return False
+            log_history(
+                session,
+                "transaction_deleted",
+                "transaction",
+                entity_id=int(transaction_id),
+                details={"description": obj.description, "amount": obj.amount},
             )
-            conn.commit()
-            return cursor.rowcount > 0
+            repo.delete(obj)
+            return True
 
     def get_stats(self) -> dict:
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) AS count, "
-                "COALESCE(SUM(CASE WHEN amount > 0 THEN amount END), 0) AS income, "
-                "COALESCE(SUM(CASE WHEN amount < 0 THEN -amount END), 0) AS expense "
-                "FROM transactions"
-            ).fetchone()
-        return {"count": row["count"], "income": row["income"], "expense": row["expense"]}
+        with session_scope(self.db_path) as session:
+            count = int(
+                session.execute(
+                    select(func.count()).select_from(Transaction)
+                ).scalar_one()
+            )
+            income = float(
+                session.execute(
+                    select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+                        Transaction.amount > 0
+                    )
+                ).scalar_one()
+            )
+            expense = float(
+                session.execute(
+                    select(
+                        func.coalesce(func.sum(-Transaction.amount), 0)
+                    ).where(Transaction.amount < 0)
+                ).scalar_one()
+            )
+        return {"count": count, "income": income, "expense": expense}
 
     def get_date_range(self) -> tuple[dt.date | None, dt.date | None]:
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT MIN(date) AS min_date, MAX(date) AS max_date FROM transactions"
-            ).fetchone()
-        if row is None or row["min_date"] is None or row["max_date"] is None:
+        with session_scope(self.db_path) as session:
+            min_date, max_date = session.execute(
+                select(func.min(Transaction.date), func.max(Transaction.date))
+            ).one()
+        if min_date is None or max_date is None:
             return None, None
-        return dt.date.fromisoformat(row["min_date"]), dt.date.fromisoformat(row["max_date"])
+        return dt.date.fromisoformat(min_date), dt.date.fromisoformat(max_date)

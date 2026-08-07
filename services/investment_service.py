@@ -1,9 +1,11 @@
-from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
+from sqlalchemy import func, select
 
-from database.database import DB_PATH, get_connection, init_db
+from database.crud import InvestmentRepository, log_history
+from database.database import DB_PATH, init_db, session_scope
+from database.models import Investment
 
 INVESTMENT_TYPES = [
     "Stocks",
@@ -19,26 +21,31 @@ class InvestmentService:
         self.db_path = Path(db_path) if db_path else DB_PATH
         init_db(self.db_path)
 
-    @contextmanager
-    def _connection(self):
-        conn = get_connection(self.db_path)
-        try:
-            yield conn
-        finally:
-            conn.close()
+    @staticmethod
+    def _frame(rows: list[Investment]) -> pd.DataFrame:
+        return pd.DataFrame(
+            [row.to_dict() for row in rows],
+            columns=["id", "name", "investment_type", "amount"],
+        )
 
     def add_investment(self, name: str, investment_type: str, amount: float) -> int:
         name = str(name).strip()
         if investment_type not in INVESTMENT_TYPES:
             raise ValueError(f"Unknown investment type: {investment_type}")
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "INSERT INTO investments (name, investment_type, amount) "
-                "VALUES (?, ?, ?)",
-                (name, investment_type, float(amount)),
+        with session_scope(self.db_path) as session:
+            obj = InvestmentRepository(session).create(
+                name=name,
+                investment_type=investment_type,
+                amount=float(amount),
             )
-            conn.commit()
-            return int(cursor.lastrowid)
+            log_history(
+                session,
+                "investment_added",
+                "investment",
+                entity_id=obj.id,
+                details={"name": name, "investment_type": investment_type, "amount": float(amount)},
+            )
+            return int(obj.id)
 
     def update_investment(
         self, investment_id: int, name: str, investment_type: str, amount: float
@@ -46,56 +53,79 @@ class InvestmentService:
         name = str(name).strip()
         if investment_type not in INVESTMENT_TYPES:
             raise ValueError(f"Unknown investment type: {investment_type}")
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "UPDATE investments SET name = ?, investment_type = ?, amount = ? "
-                "WHERE id = ?",
-                (name, investment_type, float(amount), int(investment_id)),
+        with session_scope(self.db_path) as session:
+            repo = InvestmentRepository(session)
+            updated = repo.update_by_id(
+                int(investment_id),
+                name=name,
+                investment_type=investment_type,
+                amount=float(amount),
             )
-            conn.commit()
-            return cursor.rowcount > 0
+            if updated:
+                log_history(
+                    session,
+                    "investment_updated",
+                    "investment",
+                    entity_id=int(investment_id),
+                    details={"name": name, "investment_type": investment_type, "amount": float(amount)},
+                )
+            return updated
 
     def delete_investment(self, investment_id: int) -> bool:
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "DELETE FROM investments WHERE id = ?",
-                (int(investment_id),),
+        with session_scope(self.db_path) as session:
+            repo = InvestmentRepository(session)
+            obj = repo.get(int(investment_id))
+            if obj is None:
+                return False
+            log_history(
+                session,
+                "investment_deleted",
+                "investment",
+                entity_id=int(investment_id),
+                details={"name": obj.name},
             )
-            conn.commit()
-            return cursor.rowcount > 0
+            repo.delete(obj)
+            return True
 
     def get_investment(self, investment_id: int) -> dict | None:
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT id, name, investment_type, amount FROM investments WHERE id = ?",
-                (int(investment_id),),
-            ).fetchone()
-        return dict(row) if row else None
+        with session_scope(self.db_path) as session:
+            obj = InvestmentRepository(session).get(int(investment_id))
+            return obj.to_dict() if obj else None
 
     def get_investments(self) -> pd.DataFrame:
-        with self._connection() as conn:
-            frame = pd.read_sql_query(
-                "SELECT id, name, investment_type, amount FROM investments "
-                "ORDER BY investment_type, name",
-                conn,
-            )
-        return frame
+        with session_scope(self.db_path) as session:
+            rows = session.execute(
+                select(Investment).order_by(
+                    Investment.investment_type, Investment.name
+                )
+            ).scalars().all()
+        return self._frame(rows)
 
     def get_total(self) -> float:
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(SUM(amount), 0) AS total FROM investments"
-            ).fetchone()
-        return float(row["total"])
+        with session_scope(self.db_path) as session:
+            total = session.execute(
+                select(func.coalesce(func.sum(Investment.amount), 0))
+            ).scalar_one()
+        return float(total)
 
     def get_allocation(self) -> pd.DataFrame:
-        with self._connection() as conn:
-            frame = pd.read_sql_query(
-                "SELECT investment_type, COALESCE(SUM(amount), 0) AS amount, "
-                "COUNT(*) AS count "
-                "FROM investments GROUP BY investment_type ORDER BY amount DESC",
-                conn,
-            )
+        with session_scope(self.db_path) as session:
+            rows = session.execute(
+                select(
+                    Investment.investment_type,
+                    func.coalesce(func.sum(Investment.amount), 0).label("amount"),
+                    func.count().label("count"),
+                )
+                .group_by(Investment.investment_type)
+                .order_by(func.sum(Investment.amount).desc())
+            ).all()
+        frame = pd.DataFrame(
+            [
+                {"investment_type": row[0], "amount": float(row[1]), "count": int(row[2])}
+                for row in rows
+            ],
+            columns=["investment_type", "amount", "count"],
+        )
         if not frame.empty:
             total = float(frame["amount"].sum())
             frame["percent"] = (
@@ -104,8 +134,8 @@ class InvestmentService:
         return frame
 
     def get_stats(self) -> dict:
-        with self._connection() as conn:
-            count = conn.execute(
-                "SELECT COUNT(*) AS n FROM investments"
-            ).fetchone()["n"]
-        return {"count": int(count)}
+        with session_scope(self.db_path) as session:
+            count = int(
+                session.execute(select(func.count()).select_from(Investment)).scalar_one()
+            )
+        return {"count": count}

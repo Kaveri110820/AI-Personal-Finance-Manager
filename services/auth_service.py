@@ -2,10 +2,14 @@ import hashlib
 import hmac
 import os
 import re
-from contextlib import contextmanager
 from pathlib import Path
 
-from database.database import DB_PATH, get_connection, init_db
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+
+from database.crud import UserRepository, log_history
+from database.database import DB_PATH, init_db, session_scope
+from database.models import User
 
 HASH_ALGO = "pbkdf2_sha256"
 PBKDF2_ITERATIONS = 200_000
@@ -40,14 +44,6 @@ class AuthService:
         self.db_path = Path(db_path) if db_path else DB_PATH
         init_db(self.db_path)
 
-    @contextmanager
-    def _connection(self):
-        conn = get_connection(self.db_path)
-        try:
-            yield conn
-        finally:
-            conn.close()
-
     def register(self, username: str, password: str) -> tuple[bool, str]:
         username = str(username or "").strip()
         password = str(password or "")
@@ -56,43 +52,44 @@ class AuthService:
         if len(password) < 4:
             return False, "Password must be at least 4 characters long."
         password_hash = hash_password(password)
-        with self._connection() as conn:
-            try:
-                cursor = conn.execute(
-                    "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                    (username, password_hash),
+        try:
+            with session_scope(self.db_path) as session:
+                obj = UserRepository(session).create(
+                    username=username, password_hash=password_hash
                 )
-                conn.commit()
-            except Exception:
-                return False, "That username is already taken."
-        return True, f"Account for {cursor.lastrowid} created."
+                log_history(
+                    session,
+                    "user_registered",
+                    "user",
+                    entity_id=obj.id,
+                    details={"username": username},
+                )
+        except IntegrityError:
+            return False, "That username is already taken."
+        return True, f"Account for {obj.id} created."
 
     def authenticate(self, username: str, password: str) -> bool:
         username = str(username or "").strip()
         if not username:
             return False
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT password_hash FROM users WHERE username = ? COLLATE NOCASE",
-                (username,),
-            ).fetchone()
-        if row is None:
-            return False
-        return verify_password(str(password or ""), row["password_hash"])
+        with session_scope(self.db_path) as session:
+            user = UserRepository(session).by_username_case_insensitive(username)
+            if user is None:
+                return False
+            return verify_password(str(password or ""), user.password_hash)
 
     def get_user(self, username: str) -> dict | None:
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT id, username, created_at FROM users "
-                "WHERE username = ? COLLATE NOCASE",
-                (str(username or "").strip(),),
-            ).fetchone()
-        return dict(row) if row else None
+        with session_scope(self.db_path) as session:
+            user = UserRepository(session).by_username_case_insensitive(
+                str(username or "").strip()
+            )
+            if user is None:
+                return None
+            return {"id": user.id, "username": user.username, "created_at": user.created_at}
 
     def user_count(self) -> int:
-        with self._connection() as conn:
-            row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
-        return int(row["n"])
+        with session_scope(self.db_path) as session:
+            return int(session.execute(select(func.count()).select_from(User)).scalar_one())
 
     def has_users(self) -> bool:
         return self.user_count() > 0

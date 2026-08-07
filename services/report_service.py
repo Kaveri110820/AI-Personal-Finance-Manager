@@ -1,14 +1,22 @@
 import calendar
 import datetime as dt
+import json
 from pathlib import Path
 
 import pandas as pd
 
-from database.database import DB_PATH
+from database.crud import ReportRepository
+from database.database import DB_PATH, session_scope
 from services.bill_service import BillService
 from services.budget_service import BudgetService
 from services.investment_service import InvestmentService
 from services.transaction_service import TransactionService
+
+
+def _frame_to_json(frame: pd.DataFrame | None) -> str | None:
+    if frame is None or getattr(frame, "empty", True):
+        return None
+    return frame.to_json(orient="records", date_format="iso")
 
 
 class ReportService:
@@ -78,7 +86,7 @@ class ReportService:
                 allocation["amount"] / allocation["amount"].sum() * 100
             ).round(1)
 
-        return {
+        report = {
             "start": start,
             "end": end,
             "income": income,
@@ -96,3 +104,56 @@ class ReportService:
             "investment_total": investment_total,
             "allocation": allocation,
         }
+
+        self._save_snapshot(year, month, report)
+        return report
+
+    def _save_snapshot(self, year: int, month: int, report: dict) -> None:
+        monthly_budget = report.get("monthly_budget")
+        values = {
+            "year": int(year),
+            "month": int(month),
+            "income": round(float(report.get("income", 0)), 2),
+            "expense": round(float(report.get("expense", 0)), 2),
+            "savings": round(float(report.get("savings", 0)), 2),
+            "savings_rate": float(report.get("savings_rate", 0)),
+            "budget_total": float(monthly_budget["amount"]) if monthly_budget else None,
+            "bills_total": round(float(report.get("bills_total", 0)), 2),
+            "bills_paid": round(float(report.get("bills_paid", 0)), 2),
+            "bills_pending": round(float(report.get("bills_pending", 0)), 2),
+            "investment_total": round(float(report.get("investment_total", 0)), 2),
+            "categories_json": _frame_to_json(report.get("categories")),
+            "budget_overview_json": _frame_to_json(report.get("budget_overview")),
+            "bills_json": _frame_to_json(report.get("bills")),
+            "allocation_json": _frame_to_json(report.get("allocation")),
+        }
+        with session_scope(self.db_path) as session:
+            repo = ReportRepository(session)
+            existing = repo.by_month(year, month)
+            if existing:
+                repo.update(existing, **values)
+            else:
+                repo.create(**values)
+
+    def update_summary(self, year: int, month: int, summary: dict) -> bool:
+        try:
+            payload = json.dumps(summary, default=str)
+        except (TypeError, ValueError):
+            payload = json.dumps({"data": str(summary)})
+        with session_scope(self.db_path) as session:
+            repo = ReportRepository(session)
+            report = repo.by_month(int(year), int(month))
+            if report is None:
+                return False
+            repo.update(report, summary_json=payload)
+            return True
+
+    def get_report(self, year: int, month: int) -> dict | None:
+        with session_scope(self.db_path) as session:
+            report = ReportRepository(session).by_month(int(year), int(month))
+            return report.to_dict() if report else None
+
+    def list_reports(self, limit: int | None = None) -> list[dict]:
+        with session_scope(self.db_path) as session:
+            rows = ReportRepository(session).list_ordered(limit)
+        return [row.to_dict() for row in rows]

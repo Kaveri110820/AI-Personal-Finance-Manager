@@ -1,11 +1,13 @@
 import calendar
 import datetime as dt
-from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
+from sqlalchemy import func, select
 
-from database.database import DB_PATH, get_connection, init_db
+from database.crud import BudgetRepository, log_history
+from database.database import DB_PATH, init_db, session_scope
+from database.models import Budget, Transaction
 from services.ai_service import CATEGORIES
 
 
@@ -20,103 +22,108 @@ class BudgetService:
         self.db_path = Path(db_path) if db_path else DB_PATH
         init_db(self.db_path)
 
-    @contextmanager
-    def _connection(self):
-        conn = get_connection(self.db_path)
-        try:
-            yield conn
-        finally:
-            conn.close()
-
     def add_monthly_budget(self, amount: float) -> int:
         amount = float(amount)
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT id FROM budgets WHERE scope = 'monthly'"
-            ).fetchone()
-            if row:
-                conn.execute(
-                    "UPDATE budgets SET amount = ? WHERE id = ?",
-                    (amount, row["id"]),
+        with session_scope(self.db_path) as session:
+            repo = BudgetRepository(session)
+            existing = repo.get_monthly()
+            if existing:
+                repo.update(existing, amount=amount)
+                log_history(
+                    session,
+                    "budget_updated",
+                    "budget",
+                    entity_id=existing.id,
+                    details={"scope": "monthly", "amount": amount},
                 )
-                conn.commit()
-                return int(row["id"])
-            cursor = conn.execute(
-                "INSERT INTO budgets (scope, category, amount) VALUES ('monthly', NULL, ?)",
-                (amount,),
+                return int(existing.id)
+            obj = repo.create(scope="monthly", category=None, amount=amount)
+            log_history(
+                session,
+                "budget_added",
+                "budget",
+                entity_id=obj.id,
+                details={"scope": "monthly", "amount": amount},
             )
-            conn.commit()
-            return int(cursor.lastrowid)
+            return int(obj.id)
 
     def add_category_budget(self, category: str, amount: float) -> int:
         category = str(category).strip()
         amount = float(amount)
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT id FROM budgets WHERE scope = 'category' AND category = ?",
-                (category,),
-            ).fetchone()
-            if row:
-                conn.execute(
-                    "UPDATE budgets SET amount = ? WHERE id = ?",
-                    (amount, row["id"]),
+        with session_scope(self.db_path) as session:
+            repo = BudgetRepository(session)
+            existing = repo.get_category(category)
+            if existing:
+                repo.update(existing, amount=amount)
+                log_history(
+                    session,
+                    "budget_updated",
+                    "budget",
+                    entity_id=existing.id,
+                    details={"scope": "category", "category": category, "amount": amount},
                 )
-                conn.commit()
-                return int(row["id"])
-            cursor = conn.execute(
-                "INSERT INTO budgets (scope, category, amount) VALUES ('category', ?, ?)",
-                (category, amount),
+                return int(existing.id)
+            obj = repo.create(scope="category", category=category, amount=amount)
+            log_history(
+                session,
+                "budget_added",
+                "budget",
+                entity_id=obj.id,
+                details={"scope": "category", "category": category, "amount": amount},
             )
-            conn.commit()
-            return int(cursor.lastrowid)
+            return int(obj.id)
 
     def update_budget(self, budget_id: int, amount: float) -> bool:
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "UPDATE budgets SET amount = ? WHERE id = ?",
-                (float(amount), int(budget_id)),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
+        with session_scope(self.db_path) as session:
+            repo = BudgetRepository(session)
+            updated = repo.update_by_id(int(budget_id), amount=float(amount))
+            if updated:
+                log_history(
+                    session,
+                    "budget_updated",
+                    "budget",
+                    entity_id=int(budget_id),
+                    details={"amount": float(amount)},
+                )
+            return updated
 
     def delete_budget(self, budget_id: int) -> bool:
-        with self._connection() as conn:
-            cursor = conn.execute(
-                "DELETE FROM budgets WHERE id = ?",
-                (int(budget_id),),
+        with session_scope(self.db_path) as session:
+            repo = BudgetRepository(session)
+            obj = repo.get(int(budget_id))
+            if obj is None:
+                return False
+            log_history(
+                session,
+                "budget_deleted",
+                "budget",
+                entity_id=int(budget_id),
+                details={"scope": obj.scope, "category": obj.category},
             )
-            conn.commit()
-            return cursor.rowcount > 0
+            repo.delete(obj)
+            return True
 
     def get_budget(self, budget_id: int) -> dict | None:
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT id, scope, category, amount FROM budgets WHERE id = ?",
-                (int(budget_id),),
-            ).fetchone()
-        return dict(row) if row else None
+        with session_scope(self.db_path) as session:
+            obj = BudgetRepository(session).get(int(budget_id))
+            return obj.to_dict() if obj else None
 
     def get_budgets(self) -> pd.DataFrame:
-        with self._connection() as conn:
-            frame = pd.read_sql_query(
-                "SELECT id, scope, category, amount FROM budgets ORDER BY scope, category",
-                conn,
-            )
-        return frame
+        with session_scope(self.db_path) as session:
+            rows = session.execute(
+                select(Budget).order_by(Budget.scope, Budget.category)
+            ).scalars().all()
+        return pd.DataFrame([row.to_dict() for row in rows])
 
     def get_monthly_budget(self) -> dict | None:
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT id, scope, category, amount FROM budgets WHERE scope = 'monthly'"
-            ).fetchone()
-        return dict(row) if row else None
+        with session_scope(self.db_path) as session:
+            obj = BudgetRepository(session).get_monthly()
+            return obj.to_dict() if obj else None
 
     def get_category_budgets(self) -> list[dict]:
-        with self._connection() as conn:
-            rows = conn.execute(
-                "SELECT id, scope, category, amount FROM budgets WHERE scope = 'category'"
-            ).fetchall()
-        return [dict(row) for row in rows]
+        with session_scope(self.db_path) as session:
+            rows = BudgetRepository(session).all(scope="category")
+        return [row.to_dict() for row in rows]
 
     @staticmethod
     def _month_bounds(year: int, month: int) -> tuple[str, str]:
@@ -126,26 +133,32 @@ class BudgetService:
 
     def get_spending(self, year: int, month: int) -> pd.DataFrame:
         start, end = self._month_bounds(year, month)
-        with self._connection() as conn:
-            frame = pd.read_sql_query(
-                "SELECT category, COALESCE(SUM(-amount), 0) AS spent "
-                "FROM transactions "
-                "WHERE amount < 0 AND date >= ? AND date <= ? "
-                "GROUP BY category",
-                conn,
-                params=(start, end),
-            )
-        return frame
+        with session_scope(self.db_path) as session:
+            rows = session.execute(
+                select(Transaction.category, func.coalesce(func.sum(-Transaction.amount), 0).label("spent"))
+                .where(
+                    Transaction.amount < 0,
+                    Transaction.date >= start,
+                    Transaction.date <= end,
+                )
+                .group_by(Transaction.category)
+            ).all()
+        return pd.DataFrame(
+            [{"category": row[0], "spent": float(row[1])} for row in rows],
+            columns=["category", "spent"],
+        )
 
     def get_total_spent(self, year: int, month: int) -> float:
         start, end = self._month_bounds(year, month)
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(SUM(-amount), 0) AS spent "
-                "FROM transactions WHERE amount < 0 AND date >= ? AND date <= ?",
-                (start, end),
-            ).fetchone()
-        return float(row["spent"])
+        with session_scope(self.db_path) as session:
+            total = session.execute(
+                select(func.coalesce(func.sum(-Transaction.amount), 0)).where(
+                    Transaction.amount < 0,
+                    Transaction.date >= start,
+                    Transaction.date <= end,
+                )
+            ).scalar_one()
+        return float(total)
 
     def get_overview(self, year: int, month: int) -> pd.DataFrame:
         spending = self.get_spending(year, month)
