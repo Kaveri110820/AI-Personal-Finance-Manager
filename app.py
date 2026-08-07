@@ -14,6 +14,7 @@ PAGES = {
             icon=":material/dashboard:",
             default=True,
         ),
+        st.Page("pages/analytics.py", title="Analytics", icon=":material/analytics:"),
     ],
     "Manage": [
         st.Page("pages/transactions.py", title="Transactions", icon=":material/receipt_long:"),
